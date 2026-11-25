@@ -645,6 +645,94 @@ async fn imported_subject_may_differ_from_external_subject() {
 }
 
 #[tokio::test]
+async fn malformed_jwt_bearer_response_denies_delegation() {
+    let http = idp(200, "{not-json}");
+    let mgr = build_import_manager(&http).await;
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    let payload =
+        build_payload_with_bearer(&jwt, "tool", "https://downstream.example.com", &["read"]);
+
+    let result = invoke_with_extensions(&mgr, payload, imported_user_extensions(&jwt, None)).await;
+    assert!(!result.continue_processing);
+    let violation = result.violation.expect("malformed import response");
+    assert_eq!(violation.code, "delegation.bad_response");
+    assert!(!violation.reason.contains(jwt.as_str()));
+}
+
+#[tokio::test]
+async fn jwt_bearer_rejection_does_not_echo_assertion_or_body() {
+    let body = json!({
+        "error": "invalid_grant",
+        "error_description": "assertion 'secret-value' is not active"
+    })
+    .to_string();
+    let http = idp(400, &body);
+    let mgr = build_import_manager(&http).await;
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    let payload =
+        build_payload_with_bearer(&jwt, "tool", "https://downstream.example.com", &["read"]);
+
+    let result = invoke_with_extensions(&mgr, payload, imported_user_extensions(&jwt, None)).await;
+    assert!(!result.continue_processing);
+    let violation = result.violation.expect("IdP rejection must deny");
+    assert_eq!(violation.code, "delegation.idp_rejected");
+    assert!(violation.reason.contains("invalid_grant"));
+    assert!(!violation.reason.contains("secret-value"));
+    assert!(!violation.reason.contains(jwt.as_str()));
+}
+
+#[tokio::test]
+async fn invalid_jwt_bearer_response_metadata_denies() {
+    for body in [
+        json!({ "access_token": "token" }).to_string(),
+        json!({ "token_type": "Bearer" }).to_string(),
+        json!({ "access_token": "", "token_type": "Bearer" }).to_string(),
+        json!({ "access_token": "token", "token_type": "" }).to_string(),
+        json!({ "access_token": "token", "token_type": "DPoP" }).to_string(),
+    ] {
+        let http = idp(200, &body);
+        let mgr = build_import_manager(&http).await;
+        let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+        let payload =
+            build_payload_with_bearer(&jwt, "tool", "https://downstream.example.com", &["read"]);
+        let result =
+            invoke_with_extensions(&mgr, payload, imported_user_extensions(&jwt, None)).await;
+        assert!(!result.continue_processing, "body must be rejected: {body}");
+        assert_eq!(
+            result.violation.expect("response must deny").code,
+            "delegation.bad_response"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exchange_failure_after_successful_import_denies_whole_delegation() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(TOKEN_PATH, 200, &import_response())
+            .json(
+                TOKEN_PATH,
+                400,
+                &json!({
+                    "error": "invalid_scope"
+                })
+                .to_string(),
+            ),
+    );
+    let mgr = build_import_manager(&http).await;
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    let payload =
+        build_payload_with_bearer(&jwt, "tool", "https://downstream.example.com", &["read"]);
+
+    let result = invoke_with_extensions(&mgr, payload, imported_user_extensions(&jwt, None)).await;
+    assert!(!result.continue_processing);
+    assert_eq!(
+        result.violation.expect("leg-two failure must deny").code,
+        "delegation.idp_rejected"
+    );
+}
+
+#[tokio::test]
 async fn opaque_internal_token_with_readable_final_jwt_is_subject_unverifiable() {
     let opaque_import = json!({
         "access_token": "opaque-internal-token",

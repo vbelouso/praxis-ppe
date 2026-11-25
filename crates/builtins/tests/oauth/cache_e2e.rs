@@ -27,20 +27,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use serde_json::{Value, json};
 
 use praxis_policy_core::delegation::{
-    DelegationPayload, DelegationSubject, HOOK_TOKEN_DELEGATE, TargetType, TokenDelegateHook,
+    AttenuationConfig, AuthEnforcedBy, DelegationPayload, DelegationSubject, HOOK_TOKEN_DELEGATE,
+    TargetType, TokenDelegateHook,
 };
 use praxis_policy_core::engine::PolicyEngine;
+use praxis_policy_core::extensions::raw_credentials::{
+    Credential, RawCredentialsExtension, RawInboundToken, TokenKind, TokenRole,
+};
+use praxis_policy_core::extensions::security::{KeyBinding, SecurityExtension, SubjectExtension};
 use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::http::{HttpRequest, HttpResponse, HttpTransport, HttpTransportError};
+use praxis_policy_core::http_testing::FakeTransport;
 use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 
 use praxis_policy_builtins::plugins::delegator_oauth::OAuthDelegator;
 
 const TOKEN_ENDPOINT: &str = "https://idp.test/oauth/token";
+const TOKEN_PATH: &str = "/oauth/token";
+const IMPORT_AUDIENCE: &str = "https://internal-idp.example.com/realms/internal";
 
 // =====================================================================
 // A scripted IdP
@@ -183,6 +192,138 @@ async fn build_manager(idp: &Arc<ScriptedIdp>, cache: Option<Value>) -> Arc<Poli
     mgr
 }
 
+fn jwt_with_claims(claims: Value) -> String {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+    format!("header.{encoded}.signature")
+}
+
+fn external_user_jwt(aud: Value) -> String {
+    jwt_with_claims(json!({
+        "iss": "https://external-idp.example.com",
+        "sub": "external-alice",
+        "aud": aud,
+        "jti": "import-cache-test-001",
+        "exp": 4_102_444_800_i64,
+    }))
+}
+
+fn internal_base_jwt() -> String {
+    jwt_with_claims(json!({
+        "iss": IMPORT_AUDIENCE,
+        "sub": "internal-alice",
+        "aud": IMPORT_AUDIENCE,
+        "exp": 4_102_444_800_i64
+    }))
+}
+
+fn final_downstream_jwt() -> String {
+    jwt_with_claims(json!({
+        "iss": IMPORT_AUDIENCE,
+        "sub": "internal-alice",
+        "aud": "https://downstream.example.com",
+        "scope": "read audit",
+        "exp": 4_102_444_800_i64
+    }))
+}
+
+fn import_response() -> String {
+    json!({
+        "access_token": internal_base_jwt(),
+        "token_type": "Bearer",
+        "expires_in": 300
+    })
+    .to_string()
+}
+
+fn exchange_response() -> String {
+    json!({
+        "access_token": final_downstream_jwt(),
+        "issued_token_type":
+            "urn:ietf:params:oauth:token-type:access_token",
+        "expires_in": 300,
+        "scope": "read audit"
+    })
+    .to_string()
+}
+
+fn imported_payload(bearer: &str) -> DelegationPayload {
+    DelegationPayload::new(bearer, "tool")
+        .with_target_type(TargetType::Tool)
+        .with_target_audience("https://downstream.example.com")
+        .with_required_permissions(vec!["read".to_owned()])
+        .with_auth_enforced_by(AuthEnforcedBy::Target)
+        .with_route_attenuation(AttenuationConfig {
+            capabilities: vec!["audit".into()],
+            resource_template: None,
+            actions: Vec::new(),
+            ttl_seconds: Some(120),
+        })
+}
+
+fn imported_user_extensions(jwt: &str, key_binding: Option<KeyBinding>) -> Extensions {
+    let mut raw = RawCredentialsExtension::default();
+    raw.inbound_tokens.insert(
+        TokenRole::User,
+        RawInboundToken::new(
+            jwt,
+            Credential::Header {
+                name: "Authorization".into(),
+            },
+            TokenKind::Jwt,
+        ),
+    );
+
+    let mut security = SecurityExtension::default();
+    let mut subject = SubjectExtension::default();
+    subject.id = Some("external-alice".into());
+    subject.key_binding = key_binding;
+    security.subject = Some(subject);
+
+    let mut extensions = Extensions::default();
+    extensions.raw_credentials = Some(Arc::new(raw));
+    extensions.security = Some(Arc::new(security));
+    extensions
+}
+
+async fn build_import_cache_manager(http: &Arc<FakeTransport>) -> Arc<PolicyEngine> {
+    let mut cfg = plugin_config(Some(cache_on(&["user"])));
+    cfg.config.as_mut().expect("delegator config")["subject_import"] = json!({
+        "kind": "jwt_bearer",
+        "authorization_server_audience": IMPORT_AUDIENCE,
+    });
+    cfg.capabilities = [
+        "perform_http".to_owned(),
+        "read_inbound_credentials".to_owned(),
+        "read_subject".to_owned(),
+        "read_client".to_owned(),
+    ]
+    .into();
+
+    let delegator = OAuthDelegator::new(cfg.clone()).expect("delegator constructs");
+    let mgr = Arc::new(PolicyEngine::default());
+    mgr.register_handler_for_names::<TokenDelegateHook, _>(
+        Arc::new(delegator),
+        cfg,
+        &[HOOK_TOKEN_DELEGATE],
+    )
+    .unwrap();
+    let transport: Arc<dyn HttpTransport> = http.clone();
+    mgr.set_http_transport(transport);
+    mgr.initialize().await.unwrap();
+    mgr
+}
+
+async fn invoke_with_extensions(
+    mgr: &Arc<PolicyEngine>,
+    payload: DelegationPayload,
+    extensions: Extensions,
+) -> praxis_policy_core::executor::PipelineResult {
+    let (result, _bg) = mgr
+        .invoke_named::<TokenDelegateHook>(HOOK_TOKEN_DELEGATE, payload, extensions, None)
+        .await;
+    result
+}
+
 /// Invoke, and return the minted token bytes plus where they came from.
 async fn delegate(mgr: &Arc<PolicyEngine>, payload: DelegationPayload) -> (String, String) {
     let (result, _bg) = mgr
@@ -249,6 +390,49 @@ async fn a_second_delegation_is_served_from_cache() {
         "the cached delegation must hand back the token that was minted"
     );
     assert_eq!(idp.calls(), 1, "the second delegation reached the IdP");
+}
+
+#[tokio::test]
+async fn imported_cache_hit_skips_both_network_legs() {
+    let http = Arc::new(
+        FakeTransport::new()
+            .json(TOKEN_PATH, 200, &import_response())
+            .json(TOKEN_PATH, 200, &exchange_response()),
+    );
+    let mgr = build_import_cache_manager(&http).await;
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE));
+    let extensions = imported_user_extensions(&jwt, None);
+    let payload = imported_payload(&jwt);
+
+    let first = invoke_with_extensions(&mgr, payload.clone(), extensions.clone()).await;
+    let second = invoke_with_extensions(&mgr, payload, extensions).await;
+
+    assert!(
+        first.continue_processing,
+        "first imported delegation should succeed: {:?}",
+        first.violation
+    );
+    assert!(
+        second.continue_processing,
+        "cached imported delegation should succeed: {:?}",
+        second.violation
+    );
+    assert_eq!(http.call_count_for(TOKEN_PATH), 2);
+
+    let final_payload = DelegationPayload::from_pipeline_result(&second)
+        .expect("delegation payload should be present");
+    assert_eq!(
+        final_payload
+            .delegated_token
+            .as_ref()
+            .map(|token| token.token.as_str()),
+        Some(final_downstream_jwt().as_str()),
+        "the cache must hold the downstream token, not the internal base token"
+    );
+    assert_eq!(
+        final_payload.metadata.get("delegated_token_source"),
+        Some(&serde_json::json!("cache"))
+    );
 }
 
 /// The one that matters. Two callers presenting different credentials
