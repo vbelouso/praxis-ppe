@@ -80,7 +80,6 @@ const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
 /// RFC 7523 JWT Authorization Grant — presents an already verified
 /// external JWT as the assertion while the configured OAuth client
 /// authenticates itself with HTTP Basic.
-#[allow(dead_code)]
 const GRANT_TYPE_JWT_BEARER: &str =
     "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
@@ -791,7 +790,6 @@ impl OAuthDelegator {
         Ok(())
     }
 
-    #[allow(dead_code)]
     async fn import_subject_token(
         &self,
         assertion: &str,
@@ -862,23 +860,40 @@ impl OAuthDelegator {
     ) -> Result<Mint, PluginViolation> {
         let as_this_workload = *payload.subject() == DelegationSubject::ThisWorkload;
         let is_workload = *payload.subject() == DelegationSubject::CallerWorkload;
+        let imported = self.typed.subject_import.is_some()
+            && matches!(
+                payload.subject(),
+                DelegationSubject::User | DelegationSubject::Client
+            );
         let bearer = payload.bearer_token();
         let audience = payload.target_audience().unwrap_or("");
 
         let scope = Self::requested_scopes(payload);
 
-        // Leg 1 (workload only): the SVID in `bearer` authenticates the
-        // agent as a client; mint the IdP base token here and let the
-        // exchange below run on it. Every other subject exchanges its
-        // own `bearer` directly. `Cow` avoids cloning the (already
-        // borrowed) bearer on the non-workload path.
+        // Leg 1 (workload or imported subject): mint an IdP-issued base
+        // token here and let the exchange below run on it. Workloads
+        // authenticate with an SVID client assertion; imported subjects
+        // present their already-validated external JWT. Other subjects
+        // exchange their own `bearer` directly. `Cow` avoids cloning the
+        // (already borrowed) bearer on the direct path.
         let subject_token: Cow<str> = if is_workload {
             match self.mint_base_token(bearer, ext).await {
                 Ok(token) => Cow::Owned(token),
                 Err(violation) => return Err(violation),
             }
+        } else if imported {
+            match self.import_subject_token(bearer, ext).await {
+                Ok(token) => Cow::Owned(token),
+                Err(violation) => return Err(violation),
+            }
         } else {
             Cow::Borrowed(bearer)
+        };
+
+        let subject_token_type = if imported {
+            "urn:ietf:params:oauth:token-type:access_token"
+        } else {
+            self.typed.subject_token_type.as_str()
         };
 
         // Build the form-encoded body: RFC 6749 §4.4 for this instance
@@ -896,7 +911,7 @@ impl OAuthDelegator {
                 // the raw SVID; on every other path it's the caller's
                 // own bearer, unchanged.
                 ("subject_token", subject_token.as_ref()),
-                ("subject_token_type", &self.typed.subject_token_type),
+                ("subject_token_type", subject_token_type),
                 ("audience", audience),
             ]
         };
@@ -963,7 +978,11 @@ impl OAuthDelegator {
                 ext,
                 &key,
                 "token exchange",
-                &[("audience", audience), ("scope", scope.as_str())],
+                &[
+                    ("leg", "token_exchange"),
+                    ("audience", audience),
+                    ("scope", scope.as_str()),
+                ],
                 || async {
                     let response = match ext
                         .http_request(request, RetryPolicy::undelivered_only())
@@ -1036,24 +1055,28 @@ impl OAuthDelegator {
         }
 
         let jwt_scopes = if self.typed.strict_response_validation {
-            let caller_identity = match payload.subject() {
-                DelegationSubject::User => ext
-                    .security
-                    .as_ref()
-                    .and_then(|security| security.subject.as_ref())
-                    .and_then(|subject| subject.id.as_deref()),
-                DelegationSubject::Client => ext
-                    .security
-                    .as_ref()
-                    .and_then(|security| security.client.as_ref())
-                    .map(|client| client.client_id.as_str()),
-                DelegationSubject::CallerWorkload => ext
-                    .security
-                    .as_ref()
-                    .and_then(|security| security.caller_workload.as_ref())
-                    .and_then(|workload| workload.spiffe_id.as_deref()),
-                DelegationSubject::ThisWorkload => None,
-                _ => None,
+            let caller_identity = if imported {
+                None
+            } else {
+                match payload.subject() {
+                    DelegationSubject::User => ext
+                        .security
+                        .as_ref()
+                        .and_then(|security| security.subject.as_ref())
+                        .and_then(|subject| subject.id.as_deref()),
+                    DelegationSubject::Client => ext
+                        .security
+                        .as_ref()
+                        .and_then(|security| security.client.as_ref())
+                        .map(|client| client.client_id.as_str()),
+                    DelegationSubject::CallerWorkload => ext
+                        .security
+                        .as_ref()
+                        .and_then(|security| security.caller_workload.as_ref())
+                        .and_then(|workload| workload.spiffe_id.as_deref()),
+                    DelegationSubject::ThisWorkload => None,
+                    _ => None,
+                }
             };
             validate_exchange_response(
                 &parsed,
