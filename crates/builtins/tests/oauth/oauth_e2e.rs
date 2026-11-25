@@ -41,12 +41,18 @@ use praxis_policy_core::delegation::{
     TargetType, TokenDelegateHook,
 };
 use praxis_policy_core::engine::PolicyEngine;
-use praxis_policy_core::extensions::raw_credentials::{DelegationMode, TokenRole};
+use praxis_policy_core::extensions::raw_credentials::{
+    Credential, DelegationMode, RawCredentialsExtension, RawInboundToken, TokenKind, TokenRole,
+};
+use praxis_policy_core::extensions::security::{
+    ClientExtension, KeyBinding, SecurityExtension, SubjectExtension,
+};
 use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::plugin::{OnError, PluginConfig, PluginMode};
 
 use praxis_policy_builtins::plugins::delegator_oauth::OAuthDelegator;
 
+use serde_json::Value;
 use serde_json::json;
 
 // =====================================================================
@@ -119,6 +125,90 @@ const TOKEN_PATH: &str = "/oauth/token";
 /// resolves — the transport is programmed, not dialled.
 fn token_endpoint() -> String {
     format!("https://idp.example.test{TOKEN_PATH}")
+}
+
+const IMPORT_AUDIENCE: &str = "https://internal-idp.example.com/realms/internal";
+
+fn jwt_with_claims(claims: Value) -> String {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+    format!("header.{encoded}.signature")
+}
+
+fn external_user_jwt(aud: Value, cnf: Option<Value>) -> String {
+    let mut claims = json!({
+        "iss": "https://external-idp.example.com",
+        "sub": "external-alice",
+        "aud": aud,
+        "jti": "import-test-001",
+        "exp": 4_102_444_800_i64,
+    });
+    if let Some(cnf) = cnf {
+        claims["cnf"] = cnf;
+    }
+    jwt_with_claims(claims)
+}
+
+fn imported_user_extensions(jwt: &str, key_binding: Option<KeyBinding>) -> Extensions {
+    let mut raw = RawCredentialsExtension::default();
+    raw.inbound_tokens.insert(
+        TokenRole::User,
+        RawInboundToken::new(
+            jwt,
+            Credential::Header {
+                name: "Authorization".into(),
+            },
+            TokenKind::Jwt,
+        ),
+    );
+
+    let mut security = SecurityExtension::default();
+    let mut subject = SubjectExtension::default();
+    subject.id = Some("external-alice".into());
+    subject.key_binding = key_binding;
+    security.subject = Some(subject);
+
+    let mut extensions = Extensions::default();
+    extensions.raw_credentials = Some(Arc::new(raw));
+    extensions.security = Some(Arc::new(security));
+    extensions
+}
+
+async fn build_import_manager(http: &Arc<FakeTransport>) -> Arc<PolicyEngine> {
+    let mut cfg = plugin_config(&token_endpoint());
+    cfg.config.as_mut().expect("delegator config")["subject_import"] = json!({
+        "kind": "jwt_bearer",
+        "authorization_server_audience": IMPORT_AUDIENCE,
+    });
+    cfg.capabilities = [
+        "perform_http".to_owned(),
+        "read_inbound_credentials".to_owned(),
+        "read_subject".to_owned(),
+        "read_client".to_owned(),
+    ]
+    .into();
+
+    let delegator = OAuthDelegator::new(cfg.clone()).expect("delegator constructs");
+    let mgr = Arc::new(PolicyEngine::default());
+    mgr.register_handler_for_names::<TokenDelegateHook, _>(
+        Arc::new(delegator),
+        cfg,
+        &[HOOK_TOKEN_DELEGATE],
+    )
+    .unwrap();
+    mgr.set_http_transport(http.clone());
+    mgr.initialize().await.unwrap();
+    mgr
+}
+
+async fn invoke_with_extensions(
+    mgr: &Arc<PolicyEngine>,
+    payload: DelegationPayload,
+    extensions: Extensions,
+) -> praxis_policy_core::executor::PipelineResult {
+    let (result, _bg) = mgr
+        .invoke_named::<TokenDelegateHook>(HOOK_TOKEN_DELEGATE, payload, extensions, None)
+        .await;
+    result
 }
 
 /// An engine wired to `http`.
@@ -234,6 +324,193 @@ async fn invoke(
         )
         .await;
     result
+}
+
+async fn assert_import_denied_before_network(
+    jwt: String,
+    extensions: Extensions,
+    expected_reason_fragment: &str,
+) {
+    let http = idp(
+        200,
+        &json!({
+            "access_token": "internal-token",
+            "token_type": "Bearer"
+        })
+        .to_string(),
+    );
+    let mgr = build_import_manager(&http).await;
+    let payload =
+        build_payload_with_bearer(&jwt, "tool", "https://downstream.example.com", &["read"]);
+
+    let result = invoke_with_extensions(&mgr, payload, extensions).await;
+    assert!(!result.continue_processing);
+    let violation = result.violation.expect("import must deny");
+    assert_eq!(violation.code, "delegation.bad_request");
+    assert!(violation.reason.contains(expected_reason_fragment));
+    assert_eq!(http.call_count_for(TOKEN_PATH), 0);
+}
+
+#[tokio::test]
+async fn missing_selected_raw_credential_denies_before_network() {
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    assert_import_denied_before_network(jwt, Extensions::default(), "selected inbound credential")
+        .await;
+}
+
+#[tokio::test]
+async fn opaque_selected_credential_denies_before_network() {
+    let mut raw = RawCredentialsExtension::default();
+    raw.inbound_tokens.insert(
+        TokenRole::User,
+        RawInboundToken::new(
+            "opaque-token",
+            Credential::Header {
+                name: "Authorization".into(),
+            },
+            TokenKind::Opaque,
+        ),
+    );
+    let mut extensions = Extensions::default();
+    extensions.raw_credentials = Some(Arc::new(raw));
+    assert_import_denied_before_network("opaque-token".into(), extensions, "TokenKind::Jwt").await;
+}
+
+#[tokio::test]
+async fn key_bound_identity_denies_before_network() {
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    let binding = KeyBinding {
+        method: "dpop".into(),
+        thumbprint: "thumbprint".into(),
+    };
+    assert_import_denied_before_network(
+        jwt.clone(),
+        imported_user_extensions(&jwt, Some(binding)),
+        "key-bound",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn confirmation_claim_denies_before_network_even_without_key_binding() {
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), Some(json!({ "jkt": "thumbprint" })));
+    assert_import_denied_before_network(jwt.clone(), imported_user_extensions(&jwt, None), "cnf")
+        .await;
+}
+
+#[tokio::test]
+async fn credential_mismatch_denies_before_network() {
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    let payload_extensions = imported_user_extensions(&jwt, None);
+    assert_import_denied_before_network(
+        "different-jwt".into(),
+        payload_extensions,
+        "same credential",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_import_audience_denies_before_network() {
+    let jwt = external_user_jwt(json!("https://other-as.example.com"), None);
+    assert_import_denied_before_network(
+        jwt.clone(),
+        imported_user_extensions(&jwt, None),
+        "authorization_server_audience",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn multi_audience_assertion_denies_in_strict_profile() {
+    let jwt = external_user_jwt(
+        json!([IMPORT_AUDIENCE, "https://praxis-api.example.com"]),
+        None,
+    );
+    assert_import_denied_before_network(
+        jwt.clone(),
+        imported_user_extensions(&jwt, None),
+        "exactly one audience",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn client_subject_import_is_eligible() {
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    let mut raw = RawCredentialsExtension::default();
+    raw.inbound_tokens.insert(
+        TokenRole::Client,
+        RawInboundToken::new(
+            jwt.clone(),
+            Credential::Header {
+                name: "Authorization".into(),
+            },
+            TokenKind::Jwt,
+        ),
+    );
+    let mut security = SecurityExtension::default();
+    let mut client = ClientExtension::default();
+    client.client_id = "external-client".into();
+    security.client = Some(client);
+    let mut extensions = Extensions::default();
+    extensions.raw_credentials = Some(Arc::new(raw));
+    extensions.security = Some(Arc::new(security));
+
+    let http = idp(
+        200,
+        &json!({
+            "access_token": "internal-token",
+            "token_type": "Bearer"
+        })
+        .to_string(),
+    );
+    let mgr = build_import_manager(&http).await;
+    let payload =
+        build_payload_with_bearer(&jwt, "tool", "https://downstream.example.com", &["read"])
+            .with_subject(DelegationSubject::Client);
+
+    let result = invoke_with_extensions(&mgr, payload, extensions).await;
+    assert!(
+        !result.continue_processing,
+        "leg two is not implemented yet"
+    );
+    let violation = result
+        .violation
+        .expect("the focused task ends at eligibility");
+    assert_ne!(violation.code, "delegation.bad_request");
+}
+
+#[tokio::test]
+async fn caller_workload_subject_import_is_rejected() {
+    let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
+    let http = idp(200, "{}");
+    let mgr = build_import_manager(&http).await;
+    let payload =
+        build_payload_with_bearer(&jwt, "tool", "https://downstream.example.com", &["read"])
+            .with_subject(DelegationSubject::CallerWorkload);
+
+    let result = invoke_with_extensions(&mgr, payload, imported_user_extensions(&jwt, None)).await;
+    assert!(!result.continue_processing);
+    let violation = result.violation.expect("unsupported mode must deny");
+    assert_eq!(violation.code, "delegation.bad_request");
+    assert!(violation.reason.contains("caller_workload"));
+    assert_eq!(http.call_count_for(TOKEN_PATH), 0);
+}
+
+#[tokio::test]
+async fn this_workload_subject_import_is_rejected() {
+    let http = idp(200, "{}");
+    let mgr = build_import_manager(&http).await;
+    let payload = DelegationPayload::new("", "tool")
+        .with_target_audience("https://downstream.example.com")
+        .with_subject(DelegationSubject::ThisWorkload);
+
+    let result = invoke_with_extensions(&mgr, payload, Extensions::default()).await;
+    assert!(!result.continue_processing);
+    let violation = result.violation.expect("unsupported mode must deny");
+    assert!(violation.reason.contains("this_workload"));
+    assert_eq!(http.call_count_for(TOKEN_PATH), 0);
 }
 
 // =====================================================================

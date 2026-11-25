@@ -54,7 +54,7 @@ use praxis_policy_core::context::PluginContext;
 use praxis_policy_core::delegation::{DelegationPayload, DelegationSubject, TokenDelegateHook};
 use praxis_policy_core::effect::{EffectRecord, EffectState};
 use praxis_policy_core::error::{PluginError, PluginViolation};
-use praxis_policy_core::extensions::raw_credentials::RawDelegatedToken;
+use praxis_policy_core::extensions::raw_credentials::{RawDelegatedToken, TokenKind, TokenRole};
 use praxis_policy_core::hooks::payload::Extensions;
 use praxis_policy_core::hooks::trait_def::{HookHandler, PluginResult};
 use praxis_policy_core::host::{HostServices as _, HttpRequestError};
@@ -549,6 +549,24 @@ fn bound_tokens_sent(subject_token: Option<&str>, actor_token: Option<&str>) -> 
     bound
 }
 
+fn import_role(subject: &DelegationSubject) -> Option<TokenRole> {
+    match subject {
+        DelegationSubject::User => Some(TokenRole::User),
+        DelegationSubject::Client => Some(TokenRole::Client),
+        _ => None,
+    }
+}
+
+fn audience_values(claims: &serde_json::Value) -> Vec<&str> {
+    match claims.get("aud") {
+        Some(serde_json::Value::String(aud)) => vec![aud.as_str()],
+        Some(serde_json::Value::Array(auds)) => {
+            auds.iter().filter_map(|aud| aud.as_str()).collect()
+        },
+        _ => Vec::new(),
+    }
+}
+
 /// Explain a rejected exchange that sent a `DPoP`-bound token.
 ///
 /// An `IdP` may let only the client a bound token was issued to exchange it,
@@ -618,6 +636,115 @@ impl Plugin for OAuthDelegator {
 }
 
 impl OAuthDelegator {
+    fn validate_subject_import(
+        &self,
+        payload: &DelegationPayload,
+        ext: &Extensions,
+    ) -> Result<(), PluginViolation> {
+        let Some(SubjectImportConfig::JwtBearer {
+            authorization_server_audience,
+        }) = self.typed.subject_import.as_ref()
+        else {
+            return Ok(());
+        };
+
+        let Some(role) = import_role(payload.subject()) else {
+            let mode = match payload.subject() {
+                DelegationSubject::CallerWorkload => "caller_workload",
+                DelegationSubject::ThisWorkload => "this_workload",
+                subject => {
+                    return Err(PluginViolation::new(
+                        "delegation.bad_request",
+                        format!(
+                            "subject_import supports subject: user and subject: client, got {subject:?}"
+                        ),
+                    ));
+                },
+            };
+            return Err(PluginViolation::new(
+                "delegation.bad_request",
+                format!("subject_import supports subject: user and subject: client, got {mode}"),
+            ));
+        };
+
+        let raw = ext
+            .raw_credentials
+            .as_ref()
+            .and_then(|raw| raw.inbound_tokens.get(&role))
+            .ok_or_else(|| {
+                PluginViolation::new(
+                    "delegation.bad_request",
+                    format!("subject_import requires the selected inbound credential for {role:?}"),
+                )
+            })?;
+
+        if raw.kind != TokenKind::Jwt {
+            return Err(PluginViolation::new(
+                "delegation.bad_request",
+                "subject_import requires the selected inbound credential to have TokenKind::Jwt",
+            ));
+        }
+
+        let assertion = raw.token.as_str();
+        if assertion != payload.bearer_token() {
+            return Err(PluginViolation::new(
+                "delegation.bad_request",
+                "subject_import requires DelegationPayload.bearer_token to be the same credential selected by identity resolution",
+            ));
+        }
+
+        let security_binding = match role {
+            TokenRole::User => ext
+                .security
+                .as_ref()
+                .and_then(|security| security.subject.as_ref())
+                .map(|subject| subject.key_binding.as_ref()),
+            TokenRole::Client => ext
+                .security
+                .as_ref()
+                .and_then(|security| security.client.as_ref())
+                .map(|client| client.key_binding.as_ref()),
+            _ => None,
+        };
+
+        let binding = security_binding.ok_or_else(|| {
+            PluginViolation::new(
+                "delegation.bad_request",
+                format!("subject_import requires the resolved identity for {role:?}"),
+            )
+        })?;
+        if binding.is_some() {
+            return Err(PluginViolation::new(
+                "delegation.bad_request",
+                "subject_import cannot use a key-bound identity",
+            ));
+        }
+
+        let Some(claims) = jwt_claims(assertion) else {
+            return Err(PluginViolation::new(
+                "delegation.bad_request",
+                "subject_import could not decode the selected JWT claims",
+            ));
+        };
+
+        let audiences = audience_values(&claims);
+        if audiences.as_slice() != [authorization_server_audience.as_str()] {
+            return Err(PluginViolation::new(
+                "delegation.bad_request",
+                "subject_import requires exactly one audience value equal to the configured authorization_server_audience",
+            ));
+        }
+
+        if claims.get("cnf").is_some_and(|value| !value.is_null()) {
+            return Err(PluginViolation::new(
+                "delegation.bad_request",
+                "subject_import cannot use a JWT with a non-null cnf claim",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// One RFC 8693 exchange (or RFC 6749 client-credentials grant),
     /// returning the minted credential.
     ///
@@ -980,6 +1107,10 @@ impl HookHandler<TokenDelegateHook> for OAuthDelegator {
                 "target_audience missing — RFC 8693 token exchange requires \
                  an audience to scope the minted credential",
             ));
+        }
+
+        if let Err(violation) = self.validate_subject_import(payload, ext) {
+            return PluginResult::deny(violation);
         }
 
         // The cached and uncached paths differ only in whether the
