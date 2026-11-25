@@ -559,12 +559,8 @@ async fn jwt_import_uses_two_protocol_legs() {
     )
     .with_actor(TokenRole::CallerWorkload, "actor-token");
 
-    let result = invoke_with_extensions(
-        &mgr,
-        payload,
-        imported_user_extensions(&external_jwt, None),
-    )
-    .await;
+    let result =
+        invoke_with_extensions(&mgr, payload, imported_user_extensions(&external_jwt, None)).await;
     assert!(
         result.continue_processing,
         "two-leg exchange should succeed: {:?}",
@@ -576,9 +572,9 @@ async fn jwt_import_uses_two_protocol_legs() {
     let import_body = String::from_utf8_lossy(&requests[0].body).into_owned();
     let exchange_body = String::from_utf8_lossy(&requests[1].body).into_owned();
 
-    assert!(import_body.contains(
-        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"
-    ));
+    assert!(
+        import_body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer")
+    );
     assert!(import_body.contains("assertion="));
     for forbidden in [
         "subject_token=",
@@ -592,13 +588,15 @@ async fn jwt_import_uses_two_protocol_legs() {
         assert!(!import_body.contains(forbidden), "{forbidden} on leg one");
     }
 
-    assert!(exchange_body.contains(
-        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"
-    ));
+    assert!(
+        exchange_body
+            .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange")
+    );
     assert!(exchange_body.contains("subject_token="));
-    assert!(exchange_body.contains(
-        "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token"
-    ));
+    assert!(
+        exchange_body
+            .contains("subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token")
+    );
     assert!(exchange_body.contains("audience=https%3A%2F%2Fdownstream.example.com"));
     assert!(exchange_body.contains("scope=read"));
     assert!(exchange_body.contains("actor_token=actor-token"));
@@ -610,7 +608,10 @@ async fn jwt_import_uses_two_protocol_legs() {
     let final_payload = DelegationPayload::from_pipeline_result(&result)
         .expect("delegation payload should be present");
     assert_eq!(
-        final_payload.delegated_token.as_ref().map(|token| token.token.as_str()),
+        final_payload
+            .delegated_token
+            .as_ref()
+            .map(|token| token.token.as_str()),
         Some(final_downstream_jwt().as_str())
     );
 }
@@ -631,12 +632,8 @@ async fn imported_subject_may_differ_from_external_subject() {
         &["read"],
     );
 
-    let result = invoke_with_extensions(
-        &mgr,
-        payload,
-        imported_user_extensions(&external_jwt, None),
-    )
-    .await;
+    let result =
+        invoke_with_extensions(&mgr, payload, imported_user_extensions(&external_jwt, None)).await;
     assert!(
         result.continue_processing,
         "internal sub internal-alice must not be compared with external sub external-alice: {:?}",
@@ -753,12 +750,8 @@ async fn opaque_internal_token_with_readable_final_jwt_is_subject_unverifiable()
         &["read"],
     );
 
-    let result = invoke_with_extensions(
-        &mgr,
-        payload,
-        imported_user_extensions(&external_jwt, None),
-    )
-    .await;
+    let result =
+        invoke_with_extensions(&mgr, payload, imported_user_extensions(&external_jwt, None)).await;
     assert!(!result.continue_processing);
     let violation = result.violation.expect("strict validation must deny");
     assert_eq!(violation.code, "delegation.subject_unverifiable");

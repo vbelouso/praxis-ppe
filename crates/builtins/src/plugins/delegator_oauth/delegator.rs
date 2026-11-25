@@ -82,8 +82,7 @@ const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
 /// RFC 7523 JWT Authorization Grant — presents an already verified
 /// external JWT as the assertion while the configured OAuth client
 /// authenticates itself with HTTP Basic.
-const GRANT_TYPE_JWT_BEARER: &str =
-    "urn:ietf:params:oauth:grant-type:jwt-bearer";
+const GRANT_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
 /// Default issued-token-type RFC 8693 returns.
 const DEFAULT_ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -643,9 +642,7 @@ struct JwtBearerGrantResponse {
 }
 
 #[allow(dead_code)]
-fn validate_jwt_bearer_response(
-    response: &JwtBearerGrantResponse,
-) -> Result<(), PluginViolation> {
+fn validate_jwt_bearer_response(response: &JwtBearerGrantResponse) -> Result<(), PluginViolation> {
     if response.access_token.is_empty() {
         return Err(PluginViolation::new(
             "delegation.bad_response",
@@ -805,12 +802,14 @@ impl OAuthDelegator {
         let request = self
             .token_request(&form)
             .and_then(|request| {
-                request.header("authorization", self.basic_auth_header()).map_err(|e| {
-                    Box::new(PluginViolation::new(
-                        "delegation.bad_request",
-                        format!("could not attach client credentials: {e}"),
-                    ))
-                })
+                request
+                    .header("authorization", self.basic_auth_header())
+                    .map_err(|e| {
+                        Box::new(PluginViolation::new(
+                            "delegation.bad_request",
+                            format!("could not attach client credentials: {e}"),
+                        ))
+                    })
             })
             .and_then(|request| self.with_idempotency_key(request, &key))
             .map_err(|violation| *violation)?;
@@ -824,19 +823,19 @@ impl OAuthDelegator {
                 let response = ext
                     .http_request(request, RetryPolicy::undelivered_only())
                     .await
-                    .map_err(|error| {
-                        self.violation_for("JWT bearer import POST", &error)
-                    })?;
+                    .map_err(|error| self.violation_for("JWT bearer import POST", &error))?;
 
                 if !response.is_success() {
                     return Err(idp_rejection("JWT bearer import", &response));
                 }
 
                 let parsed = serde_json::from_slice::<JwtBearerGrantResponse>(&response.body)
-                    .map_err(|error| PluginViolation::new(
-                        "delegation.bad_response",
-                        format!("JWT bearer import response wasn't valid token JSON: {error}"),
-                    ))?;
+                    .map_err(|error| {
+                        PluginViolation::new(
+                            "delegation.bad_response",
+                            format!("JWT bearer import response wasn't valid token JSON: {error}"),
+                        )
+                    })?;
                 validate_jwt_bearer_response(&parsed)?;
                 Ok(parsed.access_token)
             },
@@ -1564,8 +1563,7 @@ mod jwt_bearer_response_tests {
     #[test]
     fn rejects_missing_or_empty_token_type_semantics() {
         for token_type in ["", "   "] {
-            let error =
-                validate_jwt_bearer_response(&response("token", token_type)).unwrap_err();
+            let error = validate_jwt_bearer_response(&response("token", token_type)).unwrap_err();
             assert_eq!(error.code, "delegation.bad_response");
         }
     }
