@@ -77,6 +77,13 @@ const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-
 /// authenticates with.
 const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
 
+/// RFC 7523 JWT Authorization Grant — presents an already verified
+/// external JWT as the assertion while the configured OAuth client
+/// authenticates itself with HTTP Basic.
+#[allow(dead_code)]
+const GRANT_TYPE_JWT_BEARER: &str =
+    "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
 /// Default issued-token-type RFC 8693 returns.
 const DEFAULT_ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const JWT_ISSUED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
@@ -619,6 +626,46 @@ struct TokenExchangeResponse {
     scope: Option<String>,
 }
 
+/// Successful RFC 7523 JWT Authorization Grant response subset.
+///
+/// This is deliberately separate from `TokenExchangeResponse`: RFC 6749
+/// requires `token_type`, while RFC 8693 has its own `issued_token_type`
+/// semantics.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct JwtBearerGrantResponse {
+    access_token: String,
+    token_type: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    expires_in: Option<i64>,
+}
+
+#[allow(dead_code)]
+fn validate_jwt_bearer_response(
+    response: &JwtBearerGrantResponse,
+) -> Result<(), PluginViolation> {
+    if response.access_token.is_empty() {
+        return Err(PluginViolation::new(
+            "delegation.bad_response",
+            "authorization server omitted access_token from the JWT bearer grant response",
+        ));
+    }
+    if response.token_type.trim().is_empty() {
+        return Err(PluginViolation::new(
+            "delegation.bad_response",
+            "authorization server omitted token_type from the JWT bearer grant response",
+        ));
+    }
+    if !response.token_type.trim().eq_ignore_ascii_case("Bearer") {
+        return Err(PluginViolation::new(
+            "delegation.bad_response",
+            "JWT bearer grant returned a token_type other than Bearer",
+        ));
+    }
+    Ok(())
+}
+
 /// Subset of the standard OAuth error response — `error` is the
 /// machine-readable code (`invalid_grant`, `invalid_scope`, …).
 /// `error_description` is not modelled: an `IdP` may echo the submitted
@@ -742,6 +789,59 @@ impl OAuthDelegator {
         }
 
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn import_subject_token(
+        &self,
+        assertion: &str,
+        ext: &Extensions,
+    ) -> Result<String, PluginViolation> {
+        let form = [
+            ("grant_type", GRANT_TYPE_JWT_BEARER),
+            ("assertion", assertion),
+        ];
+        let key = new_effect_key();
+        let request = self
+            .token_request(&form)
+            .and_then(|request| {
+                request.header("authorization", self.basic_auth_header()).map_err(|e| {
+                    Box::new(PluginViolation::new(
+                        "delegation.bad_request",
+                        format!("could not attach client credentials: {e}"),
+                    ))
+                })
+            })
+            .and_then(|request| self.with_idempotency_key(request, &key))
+            .map_err(|violation| *violation)?;
+
+        self.audit_mint(
+            ext,
+            &key,
+            "JWT bearer subject import",
+            &[("leg", "jwt_bearer_import")],
+            || async {
+                let response = ext
+                    .http_request(request, RetryPolicy::undelivered_only())
+                    .await
+                    .map_err(|error| {
+                        self.violation_for("JWT bearer import POST", &error)
+                    })?;
+
+                if !response.is_success() {
+                    return Err(idp_rejection("JWT bearer import", &response));
+                }
+
+                let parsed = serde_json::from_slice::<JwtBearerGrantResponse>(&response.body)
+                    .map_err(|error| PluginViolation::new(
+                        "delegation.bad_response",
+                        format!("JWT bearer import response wasn't valid token JSON: {error}"),
+                    ))?;
+                validate_jwt_bearer_response(&parsed)?;
+                Ok(parsed.access_token)
+            },
+        )
+        .await
     }
 
     /// One RFC 8693 exchange (or RFC 6749 client-credentials grant),
@@ -1400,6 +1500,48 @@ mod response_validation_tests {
                 .code,
             "delegation.bad_response"
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod jwt_bearer_response_tests {
+    use super::*;
+
+    fn response(access_token: &str, token_type: &str) -> JwtBearerGrantResponse {
+        JwtBearerGrantResponse {
+            access_token: access_token.to_owned(),
+            token_type: token_type.to_owned(),
+            expires_in: Some(300),
+        }
+    }
+
+    #[test]
+    fn accepts_non_empty_bearer_token_type_case_insensitively() {
+        validate_jwt_bearer_response(&response("token", "Bearer")).unwrap();
+        validate_jwt_bearer_response(&response("token", "bearer")).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_access_token() {
+        let error = validate_jwt_bearer_response(&response("", "Bearer")).unwrap_err();
+        assert_eq!(error.code, "delegation.bad_response");
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_token_type_semantics() {
+        for token_type in ["", "   "] {
+            let error =
+                validate_jwt_bearer_response(&response("token", token_type)).unwrap_err();
+            assert_eq!(error.code, "delegation.bad_response");
+        }
+    }
+
+    #[test]
+    fn rejects_non_bearer_token_type() {
+        let error = validate_jwt_bearer_response(&response("token", "DPoP")).unwrap_err();
+        assert_eq!(error.code, "delegation.bad_response");
+        assert!(error.reason.contains("Bearer"));
     }
 }
 
