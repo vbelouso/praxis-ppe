@@ -557,13 +557,13 @@ fn import_role(subject: &DelegationSubject) -> Option<TokenRole> {
     }
 }
 
-fn audience_values(claims: &serde_json::Value) -> Vec<&str> {
+fn has_exactly_one_audience(claims: &serde_json::Value, expected: &str) -> bool {
     match claims.get("aud") {
-        Some(serde_json::Value::String(aud)) => vec![aud.as_str()],
-        Some(serde_json::Value::Array(auds)) => {
-            auds.iter().filter_map(|aud| aud.as_str()).collect()
+        Some(serde_json::Value::String(aud)) => aud == expected,
+        Some(serde_json::Value::Array(auds)) if auds.len() == 1 => {
+            auds[0].as_str() == Some(expected)
         },
-        _ => Vec::new(),
+        _ => false,
     }
 }
 
@@ -727,8 +727,7 @@ impl OAuthDelegator {
             ));
         };
 
-        let audiences = audience_values(&claims);
-        if audiences.as_slice() != [authorization_server_audience.as_str()] {
+        if !has_exactly_one_audience(&claims, authorization_server_audience) {
             return Err(PluginViolation::new(
                 "delegation.bad_request",
                 "subject_import requires exactly one audience value equal to the configured authorization_server_audience",

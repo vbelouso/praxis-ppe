@@ -436,6 +436,28 @@ async fn multi_audience_assertion_denies_in_strict_profile() {
 }
 
 #[tokio::test]
+async fn non_string_import_audience_member_denies_in_strict_profile() {
+    let jwt = external_user_jwt(json!([IMPORT_AUDIENCE, 123]), None);
+    assert_import_denied_before_network(
+        jwt.clone(),
+        imported_user_extensions(&jwt, None),
+        "exactly one audience",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn null_import_audience_member_denies_in_strict_profile() {
+    let jwt = external_user_jwt(json!([IMPORT_AUDIENCE, null]), None);
+    assert_import_denied_before_network(
+        jwt.clone(),
+        imported_user_extensions(&jwt, None),
+        "exactly one audience",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn client_subject_import_is_eligible() {
     let jwt = external_user_jwt(json!(IMPORT_AUDIENCE), None);
     let mut raw = RawCredentialsExtension::default();
