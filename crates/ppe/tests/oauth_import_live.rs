@@ -1,3 +1,6 @@
+//! Live Keycloak coverage for JWT bearer subject import and token exchange.
+
+#![cfg(all(feature = "oauth", feature = "http-hyper"))]
 #![allow(
     missing_docs,
     clippy::expect_used,
@@ -118,5 +121,20 @@ async fn live_keycloak_imports_external_jwt_and_exchanges_it() {
         result.continue_processing,
         "live Keycloak import failed: {:?}",
         result.violation
+    );
+    assert!(
+        result.payload_modified,
+        "live Keycloak import did not modify the delegation payload"
+    );
+
+    let final_payload = DelegationPayload::from_pipeline_result(&result)
+        .expect("live Keycloak import should return a delegation payload");
+    let delegated_token = final_payload
+        .delegated_token
+        .as_ref()
+        .expect("live Keycloak import should return a delegated token");
+    assert!(
+        !delegated_token.token.is_empty(),
+        "live Keycloak import returned an empty delegated token"
     );
 }
