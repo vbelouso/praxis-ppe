@@ -62,7 +62,9 @@ use praxis_policy_core::http::{HttpRequest, HttpResponse, HttpTransportError, fo
 use praxis_policy_core::http_retry::RetryPolicy;
 use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
-use super::cache::key::{CacheKey, DelegatorIdentity, derive as derive_cache_key};
+use super::cache::key::{
+    CacheKey, DelegatorIdentity, SubjectImportMode, derive as derive_cache_key,
+};
 use super::cache::store::{DelegatedTokenCache, Mint, Served, Source};
 use super::config::{OAuthDelegatorConfig, SubjectImportConfig};
 
@@ -1184,7 +1186,15 @@ impl OAuthDelegator {
             token_endpoint: &self.typed.token_endpoint,
             client_id: &self.typed.client_id,
         };
-        match derive_cache_key(cache.secret(), identity, payload) {
+        let subject_import = match self.typed.subject_import.as_ref() {
+            None => SubjectImportMode::Direct,
+            Some(SubjectImportConfig::JwtBearer {
+                authorization_server_audience,
+            }) => SubjectImportMode::JwtBearer {
+                audience: authorization_server_audience,
+            },
+        };
+        match derive_cache_key(cache.secret(), identity, payload, subject_import) {
             Ok(key) => Some((cache, key)),
             Err(reason) => {
                 tracing::debug!(

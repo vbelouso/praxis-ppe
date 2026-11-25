@@ -414,7 +414,7 @@ mod tests {
     use praxis_policy_core::delegation::{DelegationPayload, DelegationSubject};
 
     use super::super::config::StalenessConfig;
-    use super::super::key::{DelegatorIdentity, derive};
+    use super::super::key::{DelegatorIdentity, SubjectImportMode, derive};
     use super::*;
 
     /// A distinct error type so the tests assert on the real
@@ -453,7 +453,13 @@ mod tests {
     fn key_for(cache: &DelegatedTokenCache, bearer: &str) -> CacheKey {
         let payload = DelegationPayload::new(bearer, "billing-api")
             .with_target_audience("https://billing.example.com");
-        derive(cache.secret(), delegator(), &payload).expect("cacheable")
+        derive(
+            cache.secret(),
+            delegator(),
+            &payload,
+            SubjectImportMode::Direct,
+        )
+        .expect("cacheable")
     }
 
     /// A mint that lives `ttl` seconds from now.

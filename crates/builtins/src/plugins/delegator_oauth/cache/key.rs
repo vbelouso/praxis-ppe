@@ -88,7 +88,7 @@ use zeroize::Zeroizing;
 /// A derivation change then produces entirely different keys, so old and
 /// new entries cannot collide during a rolling restart; the old ones age
 /// out untouched instead.
-const DOMAIN: &[u8] = b"ppe.delegation.cache.v1";
+const DOMAIN: &[u8] = b"ppe.delegation.cache.v2";
 
 /// Per-process cache-key secret: 32 bytes from the OS CSPRNG, never
 /// serialized and never logged.
@@ -194,6 +194,14 @@ pub(in crate::plugins::delegator_oauth) struct DelegatorIdentity<'a> {
     pub(in crate::plugins::delegator_oauth) token_endpoint: &'a str,
     /// The OAuth client this delegator authenticates as.
     pub(in crate::plugins::delegator_oauth) client_id: &'a str,
+}
+
+/// Whether the subject credential is exchanged directly or imported into
+/// the internal identity provider first.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::plugins::delegator_oauth) enum SubjectImportMode<'a> {
+    Direct,
+    JwtBearer { audience: &'a str },
 }
 
 /// Length-prefixed encoder feeding an HMAC.
@@ -378,6 +386,7 @@ pub(in crate::plugins::delegator_oauth) fn derive(
     secret: &KeySecret,
     delegator: DelegatorIdentity<'_>,
     payload: &DelegationPayload,
+    subject_import: SubjectImportMode<'_>,
 ) -> Result<CacheKey, NotCacheable> {
     let subject = payload.subject();
     let subject_tag = subject_tag(subject).ok_or(NotCacheable::UnknownVariant)?;
@@ -419,6 +428,15 @@ pub(in crate::plugins::delegator_oauth) fn derive(
     //    the analogue of MSAL's `credential_type`, and a key resting on
     //    it alone would collide every user in `user` mode.
     enc.tag(subject_tag);
+
+    match subject_import {
+        SubjectImportMode::Direct => {
+            enc.tag(0x00);
+        },
+        SubjectImportMode::JwtBearer { audience } => {
+            enc.tag(0x01).str(audience);
+        },
+    }
 
     // 4. The credential anchor. The load-bearing component; see the
     //    module docs.
@@ -521,7 +539,8 @@ mod tests {
     }
 
     fn key_of(payload: &DelegationPayload, secret: &KeySecret) -> CacheKey {
-        derive(secret, delegator(), payload).expect("base payload is cacheable")
+        derive(secret, delegator(), payload, SubjectImportMode::Direct)
+            .expect("base payload is cacheable")
     }
 
     /// Vary one thing, assert the key moves. The point of the whole
@@ -541,6 +560,36 @@ mod tests {
     fn identical_payloads_agree() {
         let secret = secret();
         assert_eq!(key_of(&base(), &secret), key_of(&base(), &secret));
+    }
+
+    #[test]
+    fn direct_and_imported_subjects_use_distinct_cache_domains() {
+        let secret = secret();
+        let delegator = delegator();
+        let payload = base();
+
+        let direct = derive(&secret, delegator, &payload, SubjectImportMode::Direct).unwrap();
+        let imported = derive(
+            &secret,
+            delegator,
+            &payload,
+            SubjectImportMode::JwtBearer {
+                audience: "https://internal-idp.example.com/realms/internal",
+            },
+        )
+        .unwrap();
+        let other_audience = derive(
+            &secret,
+            delegator,
+            &payload,
+            SubjectImportMode::JwtBearer {
+                audience: "https://other-idp.example.com",
+            },
+        )
+        .unwrap();
+
+        assert_ne!(direct, imported);
+        assert_ne!(imported, other_audience);
     }
 
     #[test]
@@ -620,7 +669,7 @@ mod tests {
     fn varying_the_delegator_instance_misses() {
         let secret = secret();
         let payload = base();
-        let a = derive(&secret, delegator(), &payload).unwrap();
+        let a = derive(&secret, delegator(), &payload, SubjectImportMode::Direct).unwrap();
         let b = derive(
             &secret,
             DelegatorIdentity {
@@ -628,6 +677,7 @@ mod tests {
                 ..delegator()
             },
             &payload,
+            SubjectImportMode::Direct,
         )
         .unwrap();
         assert_ne!(a, b);
@@ -644,7 +694,8 @@ mod tests {
             .with_subject(DelegationSubject::ThisWorkload)
             .with_target_audience("https://billing.example.com");
 
-        let a = derive(&secret, delegator(), &payload).expect("this_workload is cacheable");
+        let a = derive(&secret, delegator(), &payload, SubjectImportMode::Direct)
+            .expect("this_workload is cacheable");
         let b = derive(
             &secret,
             DelegatorIdentity {
@@ -652,6 +703,7 @@ mod tests {
                 ..delegator()
             },
             &payload,
+            SubjectImportMode::Direct,
         )
         .expect("this_workload is cacheable");
 
@@ -665,7 +717,7 @@ mod tests {
     fn a_different_idp_endpoint_misses() {
         let secret = secret();
         let payload = base();
-        let a = derive(&secret, delegator(), &payload).unwrap();
+        let a = derive(&secret, delegator(), &payload, SubjectImportMode::Direct).unwrap();
         let b = derive(
             &secret,
             DelegatorIdentity {
@@ -673,6 +725,7 @@ mod tests {
                 ..delegator()
             },
             &payload,
+            SubjectImportMode::Direct,
         )
         .unwrap();
         assert_ne!(a, b);
@@ -786,7 +839,7 @@ mod tests {
         let secret = secret();
         let payload = DelegationPayload::new("", "billing-api");
         assert_eq!(
-            derive(&secret, delegator(), &payload),
+            derive(&secret, delegator(), &payload, SubjectImportMode::Direct),
             Err(NotCacheable::EmptyAnchor)
         );
     }
@@ -796,7 +849,7 @@ mod tests {
         let secret = secret();
         let payload =
             DelegationPayload::new("", "billing-api").with_subject(DelegationSubject::ThisWorkload);
-        derive(&secret, delegator(), &payload)
+        derive(&secret, delegator(), &payload, SubjectImportMode::Direct)
             .expect("this_workload has no inbound credential by design");
     }
 
@@ -810,7 +863,7 @@ mod tests {
             ttl_seconds: None,
         });
         assert_eq!(
-            derive(&secret, delegator(), &payload),
+            derive(&secret, delegator(), &payload, SubjectImportMode::Direct),
             Err(NotCacheable::ResourceTemplate),
             "a template rendered from request arguments would scope the token per-request"
         );
@@ -822,8 +875,8 @@ mod tests {
     #[test]
     fn keys_do_not_survive_a_change_of_secret() {
         let payload = base();
-        let a = derive(&secret(), delegator(), &payload).unwrap();
-        let b = derive(&secret(), delegator(), &payload).unwrap();
+        let a = derive(&secret(), delegator(), &payload, SubjectImportMode::Direct).unwrap();
+        let b = derive(&secret(), delegator(), &payload, SubjectImportMode::Direct).unwrap();
         assert_ne!(a, b);
     }
 
