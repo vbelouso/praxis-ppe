@@ -45,18 +45,32 @@ plugins:
   - name: workday-oauth
     kind: delegator/oauth
     hooks: [token.delegate]
+    capabilities:
+      - perform_http
+      - read_inbound_credentials
+      - read_subject
+      - read_client
     config:
-      token_endpoint: "https://idp.example.com/realms/agents/protocol/openid-connect/token"
+      token_endpoint: "https://internal-idp.example.com/realms/internal/protocol/openid-connect/token"
       client_id: "ppe-gateway"
       client_secret_source:
         kind: file
         path: /etc/ppe-secrets/client-secret
+      subject_import:
+        kind: jwt_bearer
+        authorization_server_audience: "https://internal-idp.example.com/realms/internal"
       default_outbound_header: "Authorization"
 ```
 
 It exchanges the caller's inbound token for one scoped to `audience` with the
 requested `permissions`, and attaches it to the outbound request. The result
 populates delegation attributes that later rules read.
+
+The optional `subject_import` block configures an RFC 7523 import leg before the
+RFC 8693 exchange. It supports `subject: user` and `subject: client`. Its
+`authorization_server_audience` must be non-empty. When you omit it, PPE uses
+the selected inbound credential directly and all existing delegator behavior
+stays unchanged.
 
 The bundled `delegator/vault` plugin resolves an existing PAT or API key from
 Vault KV v2 instead of minting an OAuth token. It requires

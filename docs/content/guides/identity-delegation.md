@@ -1147,6 +1147,62 @@ fixtures.
 
 [TokenReview]: https://kubernetes.io/docs/reference/kubernetes-api/authentication-resources/token-review-v1/
 
+## Importing an External JWT Before Exchange
+
+Configure `subject_import` when PPE receives a JWT from an external issuer but
+must exchange an internal authorization-server token. See
+[Delegation](../apl/delegation.md#the-delegator-plugin) for the plugin
+configuration.
+
+PPE first presents the verified external JWT to the internal authorization
+server as an RFC 7523 JWT Authorization Grant:
+
+```text
+grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer
+assertion=<external JWT>
+```
+
+The returned internal access token is then used as the RFC 8693 `subject_token`
+for the existing downstream token exchange. PPE does not send actor, audience,
+scope, or client-assertion parameters on the import leg.
+
+PPE checks import eligibility before it looks up a cached delegated token. A hit
+therefore skips both the import and exchange legs.
+
+Before you configure the bridge, meet these prerequisites:
+
+- The external issuer must issue a short-lived JWT whose single audience is the
+  configured internal authorization-server audience.
+- The JWT must include a unique `jti` for providers that reject assertion replay.
+- The inbound identity resolver must still validate the JWT normally.
+- The selected credential must be a bearer JWT: it must not be key-bound and must
+  not contain a non-null `cnf` claim.
+- The internal authorization server owns assertion validation, federated subject
+  mapping, scopes, and internal-token lifetime.
+- Keycloak requires a JWT Authorization Grant identity provider, an allowed
+  confidential client, explicit allowed audience, a pre-linked federated identity,
+  and a short assertion lifetime.
+- Keycloak client-subject interoperability is not yet runtime-verified.
+
+The external and internal `sub` values may differ because the internal
+authorization server maps the federated identity. PPE compares the final
+delegated JWT subject with the internal base-token subject, not with the external
+caller identity.
+
+### Import Limitations
+
+Version one has these limitations:
+
+- Version one does not acquire assertions from an upstream authorization mechanism.
+- Version one does not request import-leg scopes.
+- Version one does not cache internal base tokens.
+- A cache hit skips both the import and exchange legs.
+- Direct and imported delegated-token cache entries are separated by import mode
+  and audience.
+- Import and exchange failures each deny the whole delegation.
+- Retries remain undelivered-only because an assertion or token exchange may have
+  succeeded before the response was lost.
+
 ## Reading claims the way your IdP writes them
 
 The JWT identity plugin infers a subject from a token's claims. Which
