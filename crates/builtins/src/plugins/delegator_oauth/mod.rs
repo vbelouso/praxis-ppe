@@ -27,6 +27,6 @@ pub mod delegator;
 pub mod factory;
 
 pub use cache::{CacheConfig, StalenessConfig};
-pub use config::{ClientSecretSource, OAuthDelegatorConfig};
+pub use config::{ClientSecretSource, OAuthDelegatorConfig, SubjectImportConfig};
 pub use delegator::OAuthDelegator;
 pub use factory::{KIND, OAuthDelegatorFactory};

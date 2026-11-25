@@ -16,6 +16,20 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Optional conversion of an inbound external credential into an internal
+/// credential before RFC 8693 token exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubjectImportConfig {
+    /// Present the selected inbound JWT as an RFC 7523 authorization grant.
+    JwtBearer {
+        /// The single audience that must identify the internal authorization
+        /// server. This is deliberately explicit; PPE never infers it from
+        /// the token endpoint URL.
+        authorization_server_audience: String,
+    },
+}
+
 /// Top-level plugin config — what operators write under
 /// `plugins[<name>].config:` in unified-config YAML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +52,11 @@ pub struct OAuthDelegatorConfig {
     /// `access_token` — that's the default.
     #[serde(default = "default_subject_token_type")]
     pub subject_token_type: String,
+
+    /// Optional first leg that imports an external user/client credential into
+    /// the internal authorization server before the downstream exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_import: Option<SubjectImportConfig>,
 
     /// Check issued token type, granted scope, and JWT audience/subject.
     /// Disable only for an `IdP` whose response cannot meet these checks.
@@ -272,5 +291,58 @@ mod tests {
             name: "_THIS_VAR_DEFINITELY_NOT_SET_FOR_TESTS_".into(),
         };
         src.resolve().unwrap_err();
+    }
+
+    #[test]
+    fn subject_import_deserializes_jwt_bearer() {
+        let raw = json!({
+            "token_endpoint": "https://auth.example.com/oauth/token",
+            "client_id": "gateway",
+            "client_secret_source": { "kind": "literal", "secret": "dev-only" },
+            "subject_import": {
+                "kind": "jwt_bearer",
+                "authorization_server_audience":
+                    "https://internal-idp.example.com/realms/internal"
+            }
+        });
+        let cfg: OAuthDelegatorConfig = serde_json::from_value(raw).unwrap();
+        match cfg.subject_import {
+            Some(SubjectImportConfig::JwtBearer {
+                authorization_server_audience,
+            }) => assert_eq!(
+                authorization_server_audience,
+                "https://internal-idp.example.com/realms/internal"
+            ),
+            other => panic!("expected JwtBearer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subject_import_rejects_unknown_kind() {
+        let raw = json!({
+            "token_endpoint": "https://auth.example.com/oauth/token",
+            "client_id": "gateway",
+            "client_secret_source": { "kind": "literal", "secret": "dev-only" },
+            "subject_import": {
+                "kind": "subject_issuer",
+                "authorization_server_audience": "internal"
+            }
+        });
+        let error = serde_json::from_value::<OAuthDelegatorConfig>(raw)
+            .expect_err("unknown import kinds must fail deserialization");
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn subject_import_requires_authorization_server_audience() {
+        let raw = json!({
+            "token_endpoint": "https://auth.example.com/oauth/token",
+            "client_id": "gateway",
+            "client_secret_source": { "kind": "literal", "secret": "dev-only" },
+            "subject_import": { "kind": "jwt_bearer" }
+        });
+        let error = serde_json::from_value::<OAuthDelegatorConfig>(raw)
+            .expect_err("authorization_server_audience is required");
+        assert!(error.to_string().contains("authorization_server_audience"));
     }
 }

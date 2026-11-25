@@ -64,7 +64,7 @@ use praxis_policy_core::plugin::{Plugin, PluginConfig};
 
 use super::cache::key::{CacheKey, DelegatorIdentity, derive as derive_cache_key};
 use super::cache::store::{DelegatedTokenCache, Mint, Served, Source};
-use super::config::OAuthDelegatorConfig;
+use super::config::{OAuthDelegatorConfig, SubjectImportConfig};
 
 /// RFC 8693 token-exchange grant type — the value of
 /// `grant_type` in the form-encoded request body.
@@ -167,6 +167,19 @@ impl OAuthDelegator {
                     cfg.name
                 ),
             }));
+        }
+        if let Some(SubjectImportConfig::JwtBearer {
+            authorization_server_audience,
+        }) = typed.subject_import.as_ref()
+        {
+            if authorization_server_audience.trim().is_empty() {
+                return Err(Box::new(PluginError::Config {
+                    message: format!(
+                        "plugin '{}' ({KIND}): subject_import.authorization_server_audience must be non-empty",
+                        cfg.name
+                    ),
+                }));
+            }
         }
         if typed
             .allowed_extra_scopes
@@ -1493,6 +1506,20 @@ mod construction_tests {
         c["client_id"] = json!("");
         let err = err_of(c);
         assert!(err.contains("client_id must be non-empty"), "{err}");
+    }
+
+    #[test]
+    fn subject_import_rejects_whitespace_only_authorization_server_audience() {
+        let mut c = valid();
+        c["subject_import"] = json!({
+            "kind": "jwt_bearer",
+            "authorization_server_audience": "   "
+        });
+        let err = err_of(c);
+        assert!(
+            err.contains("subject_import.authorization_server_audience must be non-empty"),
+            "{err}"
+        );
     }
 
     /// A secret sourced from an environment variable that is not set must fail
