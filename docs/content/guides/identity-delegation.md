@@ -1217,6 +1217,17 @@ PPE sets `allowed_extra_scopes` to `profile` and `email` because Keycloak
 returns these default scopes in addition to the requested `read` scope. This
 setting is specific to the PPE OAuth delegator, not to Keycloak.
 
+### Planned Enhancement: Supporting Multiple Audiences
+
+PPE currently requires the external JWT to contain exactly one `aud` value.
+This restriction exists for interoperability with Keycloak 26.6; it is not an
+RFC 7523 requirement.
+
+A future enhancement should preserve RFC-compliant support for multiple `aud`
+values in the generic subject-import plugin. The Keycloak-specific restriction
+can remain in a dedicated interoperability profile or an explicit deployment
+policy setting.
+
 ### Import Limitations
 
 Version one has these limitations:
