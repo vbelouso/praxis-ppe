@@ -1189,6 +1189,34 @@ authorization server maps the federated identity. PPE compares the final
 delegated JWT subject with the internal base-token subject, not with the external
 caller identity.
 
+### Keycloak Settings and RFC Requirements
+
+The following settings are specific to the Keycloak 26.6 realm used by the live
+test. They implement the RFC requirements in Keycloak; they do not replace them.
+
+| Requirement | Standard | Keycloak setting |
+|---|---|---|
+| JWT Authorization Grant | RFC 7523 | Enable the `external-jwt` identity provider and set `oauth2.jwt.authorization.grant.enabled` to `true` on the `ppe-jwt-bridge` client. |
+| Audience validation | RFC 7523 | Set `oauth2.jwt.authorization.grant.audience` to `[{"key":"external-jwt","value":"ppe-jwt-bridge"}]`. |
+| Federated subject mapping | RFC 7523 | Link the `live-internal-subject` user to the `external-jwt` identity provider by using the external token subject. |
+| Token exchange | RFC 8693 | Set `standard.token.exchange.enabled` to `true` on the `ppe-jwt-bridge` and `ppe-external-issuer` clients. |
+| Downstream audience | RFC 8693 | Create the `read` client role on the `ppe-downstream` client, map that role to the `read` client scope, and add the scope to `ppe-jwt-bridge`. |
+
+RFC 7523 requires the `iss`, `sub`, `aud`, and `exp` claims. It does not require
+a single audience. Keycloak 26.6 rejects JWTs that contain more than one
+audience, and PPE enforces the same restriction before it sends the assertion.
+The `jti` claim is optional in RFC 7523, but the live test uses it because
+Keycloak rejects reused assertions.
+
+The custom audience mapping is a Keycloak extension. It is not part of RFC 7523
+or RFC 8693. The live test uses Keycloak standard token exchange to mint an
+external JWT whose only audience is `ppe-jwt-bridge`. This method is a
+Keycloak-specific test convenience, not an RFC requirement.
+
+PPE sets `allowed_extra_scopes` to `profile` and `email` because Keycloak
+returns these default scopes in addition to the requested `read` scope. This
+setting is specific to the PPE OAuth delegator, not to Keycloak.
+
 ### Import Limitations
 
 Version one has these limitations:
